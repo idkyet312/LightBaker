@@ -140,6 +140,7 @@ build\Release\viewer.exe --lightmap lightmap.hdr --res 512 --density 110
 | `G` | Toggle screen-space reflections (glossy) |
 | `P` | Toggle post (bloom / vignette / film grain) |
 | `T` | Toggle procedural surface texture + roughness |
+| `X` | Toggle FXAA anti-aliasing |
 | `U` | Toggle UV-atlas debug view |
 | `R` | Reload the `--lightmap` file from disk |
 | `Esc` | Release the mouse; press again to quit |

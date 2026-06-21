@@ -133,7 +133,7 @@ void main() {
     // is the reflectivity signal the SSR pass keys on.
     float rough = 1.0;
     bool isFloor = (N.y > 0.85);
-    if (isFloor) rough = 0.12;          // polished floor
+    if (isFloor) rough = 0.05;          // polished floor (very glossy)
 
     // Optional faint surface texture (albedo variation only - does NOT make
     // walls reflective, which was the source of the blotchy artifacts).
@@ -244,8 +244,9 @@ void main(){
             float mask;
             vec3 refl = ssr(P, N, mask);
             float NoV = clamp(dot(N, normalize(-P)), 0.0, 1.0);
-            float fres = 0.03 + 0.20 * pow(1.0 - NoV, 5.0);   // weak, grazing-only
-            hdr = mix(hdr, refl, clamp(mask * fres, 0.0, 0.5));
+            // Stronger floor reflection: noticeable base + grazing Fresnel boost.
+            float fres = 0.18 + 0.65 * pow(1.0 - NoV, 4.0);
+            hdr = mix(hdr, refl, clamp(mask * fres, 0.0, 0.85));
         }
     }
 
@@ -280,7 +281,54 @@ void main(){
 
     // Dither to break 8-bit banding.
     col += (hash12(vUV * uRes) - 0.5) / 255.0;
-    FragColor = vec4(col, 1.0);
+    // Store luma in alpha so the FXAA pass can read edges cheaply.
+    float luma = dot(col, vec3(0.299, 0.587, 0.114));
+    FragColor = vec4(col, luma);
+}
+)";
+
+// FXAA 3.11 (simplified) - anti-aliases the composited LDR image using the
+// luma stored in alpha. Replaces the MSAA we lost when moving to the G-buffer.
+static const char* kFxaaFrag = R"(#version 330 core
+in vec2 vUV;
+out vec4 FragColor;
+uniform sampler2D uTex;   // composited LDR color, luma in .a
+uniform vec2 uRes;
+uniform int uFXAA;
+
+void main(){
+    vec2 ip = 1.0 / uRes;
+    if (uFXAA == 0) { FragColor = vec4(texture(uTex, vUV).rgb, 1.0); return; }
+
+    float lM  = texture(uTex, vUV).a;
+    float lNW = texture(uTex, vUV + vec2(-1,-1)*ip).a;
+    float lNE = texture(uTex, vUV + vec2( 1,-1)*ip).a;
+    float lSW = texture(uTex, vUV + vec2(-1, 1)*ip).a;
+    float lSE = texture(uTex, vUV + vec2( 1, 1)*ip).a;
+
+    float lMin = min(lM, min(min(lNW,lNE), min(lSW,lSE)));
+    float lMax = max(lM, max(max(lNW,lNE), max(lSW,lSE)));
+    float range = lMax - lMin;
+
+    // Skip flat areas (no edge) -> keeps interiors crisp.
+    if (range < max(0.0312, lMax * 0.125)) {
+        FragColor = vec4(texture(uTex, vUV).rgb, 1.0);
+        return;
+    }
+
+    vec2 dir;
+    dir.x = -((lNW + lNE) - (lSW + lSE));
+    dir.y =  ((lNW + lSW) - (lNE + lSE));
+    float reduce = max((lNW+lNE+lSW+lSE) * 0.03125, 0.0078125);
+    float rcp = 1.0 / (min(abs(dir.x), abs(dir.y)) + reduce);
+    dir = clamp(dir * rcp, -8.0, 8.0) * ip;
+
+    vec3 rgbA = 0.5 * (texture(uTex, vUV + dir*(1.0/3.0-0.5)).rgb +
+                       texture(uTex, vUV + dir*(2.0/3.0-0.5)).rgb);
+    vec3 rgbB = rgbA * 0.5 + 0.25 * (texture(uTex, vUV + dir*-0.5).rgb +
+                                     texture(uTex, vUV + dir* 0.5).rgb);
+    float lB = dot(rgbB, vec3(0.299,0.587,0.114));
+    FragColor = vec4((lB < lMin || lB > lMax) ? rgbA : rgbB, 1.0);
 }
 )";
 
@@ -377,6 +425,7 @@ static bool   g_haveLightmap = false;
 static bool   g_ssr = true;      // screen-space reflections
 static bool   g_post = true;     // bloom/vignette/grain
 static bool   g_texture = true;  // procedural surface texture/roughness
+static bool   g_fxaa = true;     // FXAA anti-aliasing
 static float  g_exposure = 1.4f;
 static double g_lastX = 0, g_lastY = 0;
 static bool   g_firstMouse = true;
@@ -468,6 +517,9 @@ static void keyCb(GLFWwindow* win, int key, int, int action, int) {
     } else if (key == GLFW_KEY_T) {
         g_texture = !g_texture;
         std::printf("Surface texture/roughness: %s\n", g_texture ? "ON" : "OFF");
+    } else if (key == GLFW_KEY_X) {
+        g_fxaa = !g_fxaa;
+        std::printf("FXAA: %s\n", g_fxaa ? "ON" : "OFF");
     }
 }
 
@@ -514,6 +566,28 @@ struct GBuffer {
     }
 };
 
+// Single-texture LDR target: holds the composited image (rgb + luma in .a) so
+// the FXAA pass can sample neighbouring pixels.
+struct ColorTarget {
+    GLuint fbo = 0, tex = 0;
+    int w = 0, h = 0;
+    void resize(int nw, int nh) {
+        if (nw == w && nh == h && fbo) return;
+        w = nw; h = nh;
+        if (!fbo) glGenFramebuffers(1, &fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        if (!tex) glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
+};
+
 static void usage(const char* exe) {
     std::printf(
         "Usage: %s [options]\n"
@@ -528,7 +602,8 @@ static void usage(const char* exe) {
         "  WASD / Space / Ctrl  move; mouse = look; scroll = speed\n"
         "  B = bake lightmap (in viewer)   F = lightmap on/off\n"
         "  G = reflections (SSR) on/off     P = bloom/vignette/grain on/off\n"
-        "  T = surface texture on/off       U = UV-atlas debug view\n"
+        "  T = surface texture on/off       X = FXAA anti-aliasing on/off\n"
+        "  U = UV-atlas debug view\n"
         "  R = reload --lightmap from disk  ESC = release mouse / quit\n",
         exe);
 }
@@ -625,10 +700,12 @@ int main(int argc, char** argv) {
     GLint locN2V = glGetUniformLocation(prog, "uNormalToView");
     GLint locUseTex = glGetUniformLocation(prog, "uUseTexture");
 
-    // Post/composite program (fullscreen pass) + a dummy VAO to drive it.
+    // Post/composite + FXAA programs (fullscreen passes) + a dummy VAO.
     GLuint post = makeProgram(kPostVert, kPostFrag);
+    GLuint fxaa = makeProgram(kPostVert, kFxaaFrag);
     GLuint emptyVao; glGenVertexArrays(1, &emptyVao);
     GBuffer gbuf;
+    ColorTarget ldr;
 
     // Always create a 1x1 placeholder texture so sampling is valid even pre-bake.
     glGenTextures(1, &g_lmTex);
@@ -693,6 +770,7 @@ int main(int argc, char** argv) {
         int fbw, fbh; glfwGetFramebufferSize(win, &fbw, &fbh);
         if (fbw < 1) fbw = 1; if (fbh < 1) fbh = 1;
         gbuf.resize(fbw, fbh);
+        ldr.resize(fbw, fbh);
 
         glm::mat4 proj = glm::perspective(glm::radians(60.0f),
                                           (float)fbw / fbh, 0.02f, 100.0f);
@@ -720,8 +798,8 @@ int main(int argc, char** argv) {
         glBindVertexArray(vao);
         glDrawArrays(GL_TRIANGLES, 0, (GLsizei)verts.size());
 
-        // --- Pass 2: composite (SSR + bloom + tonemap + grade) -> screen ---
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        // --- Pass 2: composite (SSR + bloom + tonemap + grade) -> LDR target ---
+        glBindFramebuffer(GL_FRAMEBUFFER, ldr.fbo);
         glViewport(0, 0, fbw, fbh);
         glDisable(GL_DEPTH_TEST);
         glUseProgram(post);
@@ -739,6 +817,17 @@ int main(int argc, char** argv) {
         glUniform1i(glGetUniformLocation(post, "uSSR"), g_ssr ? 1 : 0);
         glUniform1i(glGetUniformLocation(post, "uPost"), g_post ? 1 : 0);
         glUniform1f(glGetUniformLocation(post, "uTime"), (float)now);
+        glBindVertexArray(emptyVao);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+
+        // --- Pass 3: FXAA -> screen ---
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glViewport(0, 0, fbw, fbh);
+        glUseProgram(fxaa);
+        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, ldr.tex);
+        glUniform1i(glGetUniformLocation(fxaa, "uTex"), 0);
+        glUniform2f(glGetUniformLocation(fxaa, "uRes"), (float)fbw, (float)fbh);
+        glUniform1i(glGetUniformLocation(fxaa, "uFXAA"), g_fxaa ? 1 : 0);
         glBindVertexArray(emptyVao);
         glDrawArrays(GL_TRIANGLES, 0, 3);
 
