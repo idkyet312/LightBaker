@@ -1,6 +1,7 @@
 #include "baker.h"
 #include "pathtracer.h"
 #include "denoiser.h"
+#include "seamstitch.h"
 #include <thread>
 #include <atomic>
 #include <vector>
@@ -53,6 +54,20 @@ void bake(const Scene& scene, Lightmap& lm, const BakeSettings& settings) {
     // gets bled outward into the chart margins.
     if (settings.denoise)
         denoiseLightmap(lm, scene);
+
+    // Least-squares seam stitching (UE GPULightmass-style): equalize the
+    // lightmap across every chart-boundary that shares a 3D mesh edge (e.g. the
+    // sphere's longitude wrap), so no visible seam remains. Runs after denoise,
+    // before dilation, so the corrected values are what gets bled into margins.
+    // Periodic-U wrap cleanup for sphere charts: blend the two meridians
+    // flanking phi=0 so independent bake/denoise noise across the wrap doesn't
+    // read as a vertical line. (The sphere mesh is welded and sampled with a
+    // consistent periodic convention, so this is the only remaining seam term.)
+    lm.fixSphereSeams(scene);
+
+    // General least-squares seam stitching for any genuine chart-to-chart cuts
+    // (band-to-band joins on the multi-chart sphere; longitude wrap per band).
+    stitchLightmapSeams(scene, lm);
 
     if (settings.dilatePx > 0) {
         std::printf("Dilating %d px...\n", settings.dilatePx);

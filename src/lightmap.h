@@ -35,6 +35,9 @@ public:
     // Bleed valid texel colors outward by 'iterations' rings to hide seams.
     void dilate(int iterations);
 
+    // Make horizontally wrapped sphere charts continuous at their u=0/u=1 edge.
+    void fixSphereSeams(const Scene& scene);
+
     const std::vector<Vec3>& pixels() const { return pixels_; }
 
     // Per-texel surface albedo (same layout as the lightmap). The lightmap

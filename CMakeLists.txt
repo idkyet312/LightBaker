@@ -28,6 +28,7 @@ add_library(bakerlib STATIC
     src/pathtracer.cpp
     src/render.cpp
     src/denoiser.cpp
+    src/seamstitch.cpp
 )
 target_include_directories(bakerlib PUBLIC src third_party)
 target_link_libraries(bakerlib PUBLIC Threads::Threads)

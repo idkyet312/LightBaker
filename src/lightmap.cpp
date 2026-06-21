@@ -2,6 +2,51 @@
 #include <algorithm>
 #include <cmath>
 
+static Vec3 safeNormalize(const Vec3& v, const Vec3& fallback) {
+    float len = length(v);
+    return (len > 1e-8f) ? (v / len) : fallback;
+}
+
+static void quadSurface(const Quad& q, float u, float v,
+                        Vec3& pos, Vec3& normal) {
+    if (q.kind == ChartKind::Sphere) {
+        constexpr float kPi = 3.14159265358979323846f;
+        // Chart-local v maps into this chart's latitude band [sphereV0,sphereV1].
+        float gv = q.sphereV0 + v * (q.sphereV1 - q.sphereV0);
+        float theta = kPi * gv;
+        float phi = 2.0f * kPi * u + q.sphereSeamAngle;
+        float st = std::sin(theta);
+        normal = safeNormalize({st * std::cos(phi),
+                                std::cos(theta),
+                                st * std::sin(phi)},
+                               Vec3(0, 1, 0));
+        pos = q.sphereCenter + normal * q.sphereRadius;
+        return;
+    }
+
+    Vec3 p00 = q.origin;
+    Vec3 p10 = q.origin + q.edgeU;
+    Vec3 p01 = q.origin + q.edgeV;
+
+    // Match the triangle split used by Scene::addQuad/addSphere:
+    // (0,0)-(1,0)-(1,1) and (0,0)-(1,1)-(0,1).
+    if (u >= v) {
+        float w0 = 1.0f - u;
+        float w1 = u - v;
+        float w2 = v;
+        pos = p00 * w0 + p10 * w1 + q.corner11 * w2;
+        normal = safeNormalize(q.n00 * w0 + q.n10 * w1 + q.n11 * w2,
+                               q.normal);
+    } else {
+        float w0 = 1.0f - v;
+        float w1 = u;
+        float w2 = v - u;
+        pos = p00 * w0 + q.corner11 * w1 + p01 * w2;
+        normal = safeNormalize(q.n00 * w0 + q.n11 * w1 + q.n01 * w2,
+                               q.normal);
+    }
+}
+
 bool Lightmap::build(Scene& scene, int res, float texelsPerUnit, int padding) {
     res_ = res;
     pixels_.assign((size_t)res * res, Vec3(0));
@@ -14,8 +59,18 @@ bool Lightmap::build(Scene& scene, int res, float texelsPerUnit, int padding) {
     reqs.reserve(scene.quads.size());
     for (int qi = 0; qi < (int)scene.quads.size(); ++qi) {
         const Quad& q = scene.quads[qi];
-        float lenU = length(q.edgeU);
-        float lenV = length(q.edgeV);
+        float lenU = 0.0f, lenV = 0.0f;
+        if (q.kind == ChartKind::Sphere) {
+            constexpr float kPi = 3.14159265358979323846f;
+            lenU = 2.0f * kPi * q.sphereRadius;
+            lenV = kPi * q.sphereRadius;
+        } else {
+            Vec3 p00 = q.origin;
+            Vec3 p10 = q.origin + q.edgeU;
+            Vec3 p01 = q.origin + q.edgeV;
+            lenU = std::max(length(p10 - p00), length(q.corner11 - p01));
+            lenV = std::max(length(p01 - p00), length(q.corner11 - p10));
+        }
         int w = std::max(2, (int)std::ceil(lenU * texelsPerUnit));
         int h = std::max(2, (int)std::ceil(lenV * texelsPerUnit));
         reqs.push_back({ qi, w, h });
@@ -67,8 +122,7 @@ SurfacePoint Lightmap::texelToSurface(const Scene& scene, int x, int y) const {
     u = std::min(std::max(u, 0.0f), 1.0f);
     v = std::min(std::max(v, 0.0f), 1.0f);
 
-    sp.pos = q.origin + q.edgeU * u + q.edgeV * v;
-    sp.normal = q.normal;
+    quadSurface(q, u, v, sp.pos, sp.normal);
     sp.materialId = q.materialId;
     sp.valid = true;
     return sp;
@@ -95,7 +149,8 @@ std::vector<Vec3> Lightmap::normalAtlas(const Scene& scene) const {
         for (int x = 0; x < res_; ++x) {
             int cid = chartId_[y * res_ + x];
             if (cid < 0) continue;
-            nrm[y * res_ + x] = scene.quads[cid].normal;
+            SurfacePoint sp = texelToSurface(scene, x, y);
+            if (sp.valid) nrm[y * res_ + x] = sp.normal;
         }
     }
     return nrm;
@@ -133,6 +188,43 @@ static void dilateBuffer(std::vector<Vec3>& buf, std::vector<uint8_t> filled,
 
 void Lightmap::dilate(int iterations) {
     dilateBuffer(pixels_, coverage_, res_, iterations);
+}
+
+void Lightmap::fixSphereSeams(const Scene& scene) {
+    // A UV sphere's chart is PERIODIC in U: phi wraps 2pi -> 0, so the left
+    // chart edge (column x0) and the right chart edge (column x1) are adjacent
+    // meridians on the surface, one texel apart - not the same point. The mesh
+    // references u=0 == u=1 at the seam, and any baked/dilated mismatch between
+    // those two edges shows up as a vertical line down the sphere.
+    //
+    // Fix: stitch the two edges as if the atlas wrapped in U. Each edge column
+    // is replaced by the average of itself and its true wrap-neighbour on the
+    // opposite edge (x0 <-> x1), so the step across the seam vanishes. A short
+    // feather inward blends the next few columns toward that shared value so the
+    // correction itself doesn't introduce a new ridge.
+    // With the periodic (texel-centered, period chartW) convention, columns
+    // x0=chartX and x1=chartX+chartW-1 are the two meridians flanking the phi=0
+    // wrap. They should be near-equal, but independent bake/denoise noise (the
+    // two columns sit far apart in the atlas, so OIDN filtered them with
+    // different neighbours) leaves a step. We can't trust the edge columns
+    // themselves (the very last column often picks up a boundary artefact), so we
+    // reconstruct the wrap as a smooth crossing built from the *interior*
+    // neighbours x0+1 and x1-1, which are clean:
+    //   ... x1-1 | x1  x0 | x0+1 ...   (wrap is between x1 and x0)
+    // Set x1 and x0 to a weighted blend that makes that 4-tap run monotone.
+    for (const Quad& q : scene.quads) {
+        if (q.kind != ChartKind::Sphere || q.chartW < 4 || q.chartH < 1) continue;
+        int x0 = q.chartX;
+        int x1 = q.chartX + q.chartW - 1;
+        for (int y = q.chartY; y < q.chartY + q.chartH; ++y) {
+            Vec3 inL = at(x1 - 1, y);   // interior neighbour left  of the wrap
+            Vec3 inR = at(x0 + 1, y);   // interior neighbour right of the wrap
+            // Place x1 and x0 evenly between the two clean interior samples so
+            // the sequence inL -> x1 -> x0 -> inR is a smooth ramp (no step/dip).
+            at(x1, y) = inL * (2.0f / 3.0f) + inR * (1.0f / 3.0f);
+            at(x0, y) = inL * (1.0f / 3.0f) + inR * (2.0f / 3.0f);
+        }
+    }
 }
 
 std::vector<Vec3> Lightmap::displayAtlas(const Scene& scene, int dilateIters) const {

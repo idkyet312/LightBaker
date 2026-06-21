@@ -6,20 +6,33 @@
 
 // Bilinear sample of the atlas at chart-local (u,v) in [0,1] for a given chart.
 static Vec3 sampleAtlas(const Lightmap& lm, const Quad& q, float u, float v) {
-    // Map chart-local UV to atlas texel space (texel centers).
-    float fx = q.chartX + u * q.chartW - 0.5f;
-    float fy = q.chartY + v * q.chartH - 0.5f;
+    // Map chart-local UV to atlas TEXEL-CENTER space. Sphere charts are periodic
+    // in U with period chartW (matching the bake, which samples texel x at
+    // u=(x+0.5)/chartW): u spans the full chartW columns and u=1 wraps to u=0, so
+    // the wrap blends true neighbour meridians (no duplicated seam column).
+    bool sphere = (q.kind == ChartKind::Sphere);
+    float fx = sphere ? (q.chartX + u * q.chartW - 0.5f)
+                      : (q.chartX + u * std::max(0, q.chartW - 1));
+    float fy = q.chartY + v * std::max(0, q.chartH - 1);
     int x0 = (int)std::floor(fx);
     int y0 = (int)std::floor(fy);
     float tx = fx - x0;
     float ty = fy - y0;
 
-    auto clampX = [&](int x) { return std::min(std::max(x, 0), lm.res() - 1); };
-    int x1 = clampX(x0 + 1), y1 = clampX(y0 + 1);
-    x0 = clampX(x0); y0 = clampX(y0);
+    auto sample = [&](int x, int y) {
+        y = std::min(std::max(y, q.chartY), q.chartY + q.chartH - 1);
+        if (sphere) {
+            int localX = x - q.chartX;
+            localX = ((localX % q.chartW) + q.chartW) % q.chartW;
+            x = q.chartX + localX;
+        } else {
+            x = std::min(std::max(x, q.chartX), q.chartX + q.chartW - 1);
+        }
+        return lm.at(x, y);
+    };
 
-    Vec3 c00 = lm.at(x0, y0), c10 = lm.at(x1, y0);
-    Vec3 c01 = lm.at(x0, y1), c11 = lm.at(x1, y1);
+    Vec3 c00 = sample(x0, y0), c10 = sample(x0 + 1, y0);
+    Vec3 c01 = sample(x0, y0 + 1), c11 = sample(x0 + 1, y0 + 1);
     Vec3 a = c00 * (1 - tx) + c10 * tx;
     Vec3 b = c01 * (1 - tx) + c11 * tx;
     return a * (1 - ty) + b * ty;

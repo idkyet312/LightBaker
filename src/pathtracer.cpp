@@ -1,5 +1,16 @@
 #include "pathtracer.h"
 
+static Vec3 safeNormalize(const Vec3& v, const Vec3& fallback) {
+    float len = length(v);
+    return (len > 1e-8f) ? (v / len) : fallback;
+}
+
+static Vec3 shadingNormalAt(const Triangle& tri, const Hit& hit) {
+    float w0 = 1.0f - hit.u - hit.v;
+    return safeNormalize(tri.n0 * w0 + tri.n1 * hit.u + tri.n2 * hit.v,
+                         tri.ng);
+}
+
 // Direct lighting at a diffuse point via next-event estimation: sample a point
 // on each area light and add its (shadow-tested) contribution. Returns the
 // Next-event estimation: the albedo-free *direct irradiance* arriving at point
@@ -54,7 +65,7 @@ Vec3 radiance(const Scene& scene, Ray ray, RNG& rng, int maxBounces) {
         const Material& mat = scene.materials[tri.materialId];
 
         Vec3 P = ray.origin + ray.dir * hit.t;
-        Vec3 N = tri.ng;
+        Vec3 N = shadingNormalAt(tri, hit);
         if (dot(N, ray.dir) > 0.0f) N = -N;
 
         // Direct lighting via NEE. Reflected radiance = (albedo/pi) * E_direct.

@@ -11,6 +11,16 @@ out/
 # Vendored prebuilt OIDN SDK (download separately - see README)
 third_party/oidn/
 
+# Vendored NVIDIA RTX Neural Texture Compression SDK (~588 MB, built from
+# source - clone separately, see README). GitHub rejects files >100 MB anyway.
+third_party/RTXNTC/
+
+# Vendored xatlas (UV unwrapping). Clone separately - see README.
+third_party/xatlas/
+
+# Scratch screenshots
+p.png
+
 # Generated bake outputs
 lightmap.png
 lightmap.hdr

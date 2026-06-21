@@ -9,6 +9,7 @@ struct Triangle {
     Vec3 p0, p1, p2;        // world-space positions
     Vec2 uv0, uv1, uv2;     // lightmap UV2 (filled in by the atlas builder)
     Vec3 ng;                // geometric normal (unit)
+    Vec3 n0, n1, n2;        // shading normals at the vertices (unit)
     int materialId = 0;
     int chartId = -1;       // which atlas chart this tri belongs to
 

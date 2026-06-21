@@ -35,18 +35,29 @@
 #include <cmath>
 #include <thread>
 #include <atomic>
+#include <algorithm>
 
 // ---------------------------------------------------------------------------
-// Interleaved vertex: world position + atlas UV + normal + albedo.
+// Interleaved vertex: world position + atlas UV + normal + albedo + SSR tag +
+// chart rect. The chart rect (atlas texels: x,y,w,h) lets the fragment shader
+// sample U-periodic charts (the sphere) with manual wrapped bilinear, so the
+// longitude seam doesn't show. w<=0 means "plain clamped sampling".
 // ---------------------------------------------------------------------------
-struct GLVertex { float px, py, pz; float u, v; float nx, ny, nz; float ar, ag, ab; };
+struct GLVertex {
+    float px, py, pz;
+    float u, v;
+    float nx, ny, nz;
+    float ar, ag, ab;
+    float ssrTarget;
+    float cx, cy, cw, ch;   // chart rect in atlas texels (cw<=0 => no wrap)
+};
 
 // Map a triangle's chart-local UV (0..1 within its quad) to atlas UV (0..1
 // across the whole atlas), matching how the baker/preview place charts.
 static void chartUVtoAtlas(const Quad& q, int res, float lu, float lv,
                            float& au, float& av) {
-    float texX = q.chartX + lu * q.chartW;
-    float texY = q.chartY + lv * q.chartH;
+    float texX = q.chartX + 0.5f + lu * (float)std::max(0, q.chartW - 1);
+    float texY = q.chartY + 0.5f + lv * (float)std::max(0, q.chartH - 1);
     au = texX / (float)res;
     av = texY / (float)res;
 }
@@ -62,12 +73,26 @@ static std::vector<GLVertex> buildVertices(const Scene& scene, int res) {
         Vec3 alb = (maxComp(m.emission) > 0.0f) ? Vec3(1.0f) : m.albedo;
         const Vec3 p[3] = { t.p0, t.p1, t.p2 };
         const Vec2 uv[3] = { t.uv0, t.uv1, t.uv2 };
+        const Vec3 n[3] = { t.n0, t.n1, t.n2 };
+        bool isSphere = (q.kind == ChartKind::Sphere);
+        float ssrTarget = isSphere ? 0.0f : 1.0f;
         for (int i = 0; i < 3; ++i) {
-            float au, av;
-            chartUVtoAtlas(q, res, uv[i].x, uv[i].y, au, av);
-            verts.push_back({ p[i].x, p[i].y, p[i].z, au, av,
-                              t.ng.x, t.ng.y, t.ng.z,
-                              alb.x, alb.y, alb.z });
+            float su, sv;        // value stored in the UV attribute
+            float cw;            // chart width signal (>0 => shader wraps in U)
+            if (isSphere) {
+                // Hand the shader the CHART-LOCAL uv + chart rect so it can do
+                // U-periodic bilinear itself (the atlas can't GL_REPEAT a region).
+                su = uv[i].x; sv = uv[i].y;
+                cw = (float)q.chartW;
+            } else {
+                // Flat charts: pre-bake the atlas uv and disable wrapping.
+                chartUVtoAtlas(q, res, uv[i].x, uv[i].y, su, sv);
+                cw = 0.0f;
+            }
+            verts.push_back({ p[i].x, p[i].y, p[i].z, su, sv,
+                              n[i].x, n[i].y, n[i].z,
+                              alb.x, alb.y, alb.z, ssrTarget,
+                              (float)q.chartX, (float)q.chartY, cw, (float)q.chartH });
         }
     }
     return verts;
@@ -81,16 +106,22 @@ layout(location=0) in vec3 aPos;
 layout(location=1) in vec2 aUV;
 layout(location=2) in vec3 aNormal;
 layout(location=3) in vec3 aAlbedo;
+layout(location=4) in float aSSRTarget;
+layout(location=5) in vec4 aChartRect;   // atlas texels x,y,w,h (w<=0 => no wrap)
 uniform mat4 uMVP;
 out vec2 vUV;
 out vec3 vNormal;
 out vec3 vWorldPos;
 out vec3 vAlbedo;
+out float vSSRTarget;
+flat out vec4 vChartRect;   // flat: chart rect is per-triangle, must NOT interpolate
 void main() {
     vUV = aUV;
     vNormal = aNormal;
     vWorldPos = aPos;
     vAlbedo = aAlbedo;
+    vSSRTarget = aSSRTarget;
+    vChartRect = aChartRect;
     gl_Position = uMVP * vec4(aPos, 1.0);
 }
 )";
@@ -102,11 +133,14 @@ in vec2 vUV;
 in vec3 vNormal;
 in vec3 vWorldPos;
 in vec3 vAlbedo;
+in float vSSRTarget;
+flat in vec4 vChartRect;    // atlas texels x,y,w,h (w<=0 => plain clamped sampling)
 
 layout(location=0) out vec4 oColor;      // linear HDR radiance
 layout(location=1) out vec4 oNormalRough; // viewNormal.xyz (0..1), roughness in .a
 
 uniform sampler2D uLightmap;
+uniform float uAtlasRes;    // lightmap atlas resolution (texels)
 uniform float uExposure;
 uniform int uMode;          // 0 = shaded, 1 = lightmap, 2 = UV debug
 uniform vec3 uCamPos;
@@ -114,6 +148,38 @@ uniform mat3 uNormalToView; // world->view for normals
 uniform int uUseTexture;    // procedural surface texture/roughness on/off
 uniform vec3 uLightPos;     // ceiling light center (for a subtle specular)
 uniform int uSpec;          // subtle specular highlight on/off
+
+// Sample the lightmap for one fragment. Flat charts use ordinary clamped
+// bilinear (chart.w<=0). The sphere chart is PERIODIC in U: phi wraps 2pi->0,
+// so its left/right atlas edges are adjacent meridians. GL_CLAMP_TO_EDGE would
+// show that wrap as a vertical seam, so we do bilinear by hand here, wrapping
+// the column index modulo chartW and clamping the row - exactly matching the
+// offline preview's sampler.
+vec3 sampleLightmap() {
+    if (vChartRect.z <= 0.0) return texture(uLightmap, vUV).rgb;
+
+    float cx = vChartRect.x, cy = vChartRect.y;
+    float cw = vChartRect.z, ch = vChartRect.w;
+    // Sphere chart: U is PERIODIC with period cw (matches the bake, which samples
+    // texel x at u=(x+0.5)/cw). u spans all cw columns and u=1 wraps to u=0, so
+    // the wrap blends true neighbour meridians instead of duplicating the seam
+    // column. V stays endpoint-clamped over (ch-1). Mirrors render.cpp sampleAtlas.
+    float fx = cx + clamp(vUV.x, 0.0, 1.0) * cw - 0.5;
+    float fy = cy + 0.5 + clamp(vUV.y, 0.0, 1.0) * max(0.0, ch - 1.0);
+    float x0 = floor(fx), y0 = floor(fy - 0.5);
+    float tx = fx - x0, ty = (fy - 0.5) - y0;
+
+    // Fetch a single atlas texel with U wrapped within the chart, V clamped.
+    // (texelFetch keeps it exact - no reliance on the texture's wrap mode.)
+    int W = int(cw);
+    vec3 c00 = texelFetch(uLightmap, ivec2(int(cx) + ((int(x0)   - int(cx)) % W + W) % W, clamp(int(y0),   int(cy), int(cy+ch)-1)), 0).rgb;
+    vec3 c10 = texelFetch(uLightmap, ivec2(int(cx) + ((int(x0)+1 - int(cx)) % W + W) % W, clamp(int(y0),   int(cy), int(cy+ch)-1)), 0).rgb;
+    vec3 c01 = texelFetch(uLightmap, ivec2(int(cx) + ((int(x0)   - int(cx)) % W + W) % W, clamp(int(y0)+1, int(cy), int(cy+ch)-1)), 0).rgb;
+    vec3 c11 = texelFetch(uLightmap, ivec2(int(cx) + ((int(x0)+1 - int(cx)) % W + W) % W, clamp(int(y0)+1, int(cy), int(cy+ch)-1)), 0).rgb;
+    vec3 a = mix(c00, c10, tx);
+    vec3 b = mix(c01, c11, tx);
+    return mix(a, b, ty);
+}
 
 // Value noise for subtle procedural surface variation.
 float hash13(vec3 p){ p=fract(p*0.1031); p+=dot(p,p.yzx+33.33); return fract((p.x+p.y)*p.z); }
@@ -135,7 +201,7 @@ void main() {
     // is the reflectivity signal the SSR pass keys on.
     float rough = 1.0;
     bool isFloor = (N.y > 0.85);
-    if (isFloor) rough = 0.05;          // polished floor (very glossy)
+    if (isFloor) rough = 0.18;          // glossy, but not mirror-polished
 
     // Optional faint surface texture (albedo variation only - does NOT make
     // walls reflective, which was the source of the blotchy artifacts).
@@ -146,7 +212,7 @@ void main() {
 
     vec3 col;
     if (uMode == 1) {
-        vec3 irr = texture(uLightmap, vUV).rgb;
+        vec3 irr = sampleLightmap();
         col = irr * albedo * uExposure;              // linear HDR (no tonemap here)
 
         // Subtle specular sheen from the ceiling light on ALL surfaces, so
@@ -177,7 +243,10 @@ void main() {
 
     oColor = vec4(col, 1.0);
     vec3 vN = normalize(uNormalToView * N);
-    oNormalRough = vec4(vN * 0.5 + 0.5, rough);
+    // Alpha doubles as a compact SSR tag: floor < 0.3 can emit reflections;
+    // 0.5 marks curved objects that should not be SSR targets; 1.0 is stable matte geometry.
+    float ssrTag = (vSSRTarget < 0.5) ? 0.5 : rough;
+    oNormalRough = vec4(vN * 0.5 + 0.5, ssrTag);
 }
 )";
 
@@ -221,15 +290,39 @@ vec3 viewPos(vec2 uv){
     return v.xyz / v.w;
 }
 
+float contactFade(vec2 uv, float sourceZ){
+    vec2 px = 1.0 / uRes;
+    float closer = 0.0;
+    for (int i=0;i<8;i++){
+        float a = float(i) * 0.785398163;
+        vec2 q = uv + vec2(cos(a), sin(a)) * px * 8.0;
+        if (q.x<0.0||q.x>1.0||q.y<0.0||q.y>1.0) continue;
+        float z = viewPos(q).z;
+        closer = max(closer, smoothstep(0.02, 0.14, z - sourceZ));
+    }
+    return 1.0 - closer * 0.9;
+}
+
+vec3 sampleReflection(vec2 uv){
+    vec2 px = 1.75 / uRes;
+    vec3 c = texture(uScene, uv).rgb * 0.40;
+    c += texture(uScene, uv + vec2( px.x, 0.0)).rgb * 0.15;
+    c += texture(uScene, uv + vec2(-px.x, 0.0)).rgb * 0.15;
+    c += texture(uScene, uv + vec2(0.0,  px.y)).rgb * 0.15;
+    c += texture(uScene, uv + vec2(0.0, -px.y)).rgb * 0.15;
+    return c;
+}
+
 // Screen-space reflection ray-march; returns reflected color and a hit mask.
-// Uses a tight thickness test to avoid false hits that smear across surfaces.
+// Rejects reflective-floor self hits, which otherwise smear the floor back into
+// itself as comb-like streaks around contact shadows.
 vec3 ssr(vec3 P, vec3 N, out float hitMask){
     hitMask = 0.0;
     vec3 V = normalize(P);             // view dir (camera at origin in view space)
     vec3 R = reflect(V, N);
     if (R.z > 0.0) return vec3(0.0);   // reflecting toward camera plane: skip
-    float stepLen = 0.02;
-    vec3 pos = P + N * 0.01;           // bias off the surface
+    float stepLen = 0.035;
+    vec3 pos = P + N * 0.02 + R * 0.04; // bias away from the source floor pixel
     for (int i=0;i<64;i++){
         pos += R * stepLen;
         stepLen *= 1.05;
@@ -240,12 +333,17 @@ vec3 ssr(vec3 P, vec3 N, out float hitMask){
         float sceneZ = viewPos(uv).z;
         // Tight thickness window: ray must be just behind the stored surface.
         float dz = sceneZ - pos.z;
-        if (dz > 0.001 && dz < 0.06){
+        if (dz > 0.001 && dz < 0.045){
+            vec4 hitNR = texture(uNormalRough, uv);
+            if (hitNR.a < 0.95) continue; // reject floor self-hits and curved contact objects
+            vec3 hitN = normalize(hitNR.xyz * 2.0 - 1.0);
+            if (dot(hitN, R) >= -0.03) continue;
             // fade near screen edges to hide SSR's hard cutoffs
             vec2 e = smoothstep(vec2(0.0), vec2(0.15), uv) *
                      smoothstep(vec2(0.0), vec2(0.15), 1.0-uv);
-            hitMask = e.x*e.y;
-            return texture(uScene, uv).rgb;
+            float distFade = 1.0 - smoothstep(1.0, 4.0, length(pos - P));
+            hitMask = e.x * e.y * distFade;
+            return sampleReflection(uv);
         }
     }
     return vec3(0.0);
@@ -263,9 +361,9 @@ void main(){
             float mask;
             vec3 refl = ssr(P, N, mask);
             float NoV = clamp(dot(N, normalize(-P)), 0.0, 1.0);
-            // Stronger floor reflection: noticeable base + grazing Fresnel boost.
-            float fres = 0.18 + 0.65 * pow(1.0 - NoV, 4.0);
-            hdr = mix(hdr, refl, clamp(mask * fres, 0.0, 0.85));
+            float fres = 0.10 + 0.35 * pow(1.0 - NoV, 4.0);
+            float contact = contactFade(vUV, P.z);
+            hdr = mix(hdr, refl, clamp(mask * fres * contact, 0.0, 0.30));
         }
     }
 
@@ -277,12 +375,12 @@ void main(){
             for (int r=1;r<=4;r++){
                 vec2 off = vec2(cos(a),sin(a)) * (float(r)*4.5) / uRes;
                 vec3 s = texture(uScene, vUV+off).rgb;
-                vec3 bright = max(s - 0.8, 0.0);    // softer threshold -> bigger halo
+                vec3 bright = max(s - 2.2, 0.0);    // bloom only truly bright emitters
                 float w = 1.0/float(r);
                 bloom += bright * w; wsum += w;
             }
         }
-        hdr += (bloom/max(wsum,1e-3)) * 0.8;
+        hdr += (bloom/max(wsum,1e-3)) * 0.45;
     }
 
     // --- Tonemap + gamma ---
@@ -713,12 +811,17 @@ int main(int argc, char** argv) {
     glEnableVertexAttribArray(2);
     glVertexAttribPointer(3, 3, GL_FLOAT, GL_FALSE, sizeof(GLVertex), (void*)(8 * sizeof(float)));
     glEnableVertexAttribArray(3);
+    glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, sizeof(GLVertex), (void*)(11 * sizeof(float)));
+    glEnableVertexAttribArray(4);
+    glVertexAttribPointer(5, 4, GL_FLOAT, GL_FALSE, sizeof(GLVertex), (void*)(12 * sizeof(float)));
+    glEnableVertexAttribArray(5);
 
     GLuint prog = makeProgram(kVert, kFrag);
     GLint locMVP = glGetUniformLocation(prog, "uMVP");
     GLint locExp = glGetUniformLocation(prog, "uExposure");
     GLint locMode = glGetUniformLocation(prog, "uMode");
     GLint locTex = glGetUniformLocation(prog, "uLightmap");
+    GLint locAtlasRes = glGetUniformLocation(prog, "uAtlasRes");
     GLint locCam = glGetUniformLocation(prog, "uCamPos");
     GLint locN2V = glGetUniformLocation(prog, "uNormalToView");
     GLint locUseTex = glGetUniformLocation(prog, "uUseTexture");
@@ -822,6 +925,7 @@ int main(int argc, char** argv) {
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, g_lmTex);
         glUniform1i(locTex, 0);
+        glUniform1f(locAtlasRes, (float)res);
         glBindVertexArray(vao);
         glDrawArrays(GL_TRIANGLES, 0, (GLsizei)verts.size());
 

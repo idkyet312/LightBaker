@@ -24,14 +24,24 @@ To enable it, drop Intel's prebuilt Windows SDK into `third_party/oidn/` (the la
 baker still works — just bake at higher `--spp`. Toggle per run with `--denoise` /
 `--no-denoise` (on by default).
 
+### Neural Texture Compression (experimental)
+
+The baked atlas can be round-tripped through NVIDIA's
+[RTX Neural Texture Compression SDK](https://github.com/NVIDIA-RTX/RTXNTC)
+(bake → compress to `.ntc` → decompress → display) as an end-to-end NTC demo.
+The SDK is ~588 MB and built from source against CUDA, so it is **not committed**
+(git-ignored under `third_party/RTXNTC/`). See **[NTC_SETUP.md](NTC_SETUP.md)**
+for the one-time CUDA + build steps.
+
 ## What it does
 
-1. Builds a Cornell box in code (`buildCornellBox`) — colored walls, two boxes, a ceiling area light.
-2. Packs each quad into a shared lightmap atlas (shelf packing + procedural UV2).
+1. Builds a Cornell box in code (`buildCornellBox`) — colored walls, one box, one sphere, a ceiling area light.
+2. Packs each lightmap chart into a shared atlas (shelf packing + procedural UV2).
 3. For every covered texel, reconstructs the world-space surface point and integrates
    incoming radiance with a Monte Carlo **path tracer** (cosine-weighted hemisphere
    sampling, N diffuse bounces, russian roulette). Multithreaded over atlas rows.
-4. Dilates chart edges to avoid seams, tonemaps (Reinhard + gamma), and writes:
+4. Denoises (optional OIDN), **least-squares seam-stitches** chart boundaries that share
+   a 3D mesh edge, dilates chart edges, tonemaps (Reinhard + gamma), and writes:
    - `lightmap.png` — the baked atlas
    - `preview.png` — a camera view that *samples the baked atlas* (not re-traced)
 
@@ -88,9 +98,9 @@ build\Release\baker.exe --res 256 --spp 64 --bounces 3
 
 The Cornell box is the canonical GI test. In `preview.png` you should see:
 
-- The box softly lit by the ceiling light with **soft contact shadows** under the boxes.
+- The box softly lit by the ceiling light with **soft contact shadows** under the objects.
 - **Color bleeding** — a red tint near the left wall and a green tint near the right wall
-  spilling onto the floor and boxes. This only appears with multi-bounce GI and is the
+  spilling onto the floor and objects. This only appears with multi-bounce GI and is the
   proof the baker works.
 - No black seams at chart boundaries (the dilation pass handles this).
 
@@ -147,7 +157,7 @@ build\Release\viewer.exe --lightmap lightmap.hdr --res 512 --density 110
 | `Esc` | Release the mouse; press again to quit |
 
 The viewer renders the scene to an HDR G-buffer, then a composite pass adds
-**screen-space reflections** (the glossy floor reflects the boxes/walls), **bloom**
+**screen-space reflections** (the glossy floor reflects the objects/walls), **bloom**
 around the bright light, a filmic **ACES** tonemap, **vignette**, and subtle **film
 grain** — on top of the baked diffuse GI. Toggle each with the keys above.
 
@@ -172,11 +182,12 @@ grain** — on top of the baked diffuse GI. Toggle each with the keys above.
 | `src/rng.h` | PCG32 RNG + cosine-weighted hemisphere sampling |
 | `src/geometry.h` | Triangle, Möller–Trumbore, AABB |
 | `src/bvh.*` | BVH (closest-hit + occlusion) |
-| `src/scene.*` | Materials, quads, `buildCornellBox()` |
+| `src/scene.*` | Materials, charts, `buildCornellBox()` |
 | `src/lightmap.*` | Atlas packing, texel↔surface mapping, dilation |
 | `src/pathtracer.*` | `radiance()` GI estimator (NEE), `bakePoint()` |
 | `src/baker.*` | Multithreaded per-texel baking |
 | `src/denoiser.*` | Optional OIDN denoise of the irradiance atlas |
+| `src/seamstitch.*` | Least-squares lightmap seam stitching across chart cuts |
 | `src/render.*` | Preview camera sampling the atlas |
 | `src/main.cpp` | Baker CLI: tonemap, PNG/HDR output |
 | `src/viewer.cpp` | Real-time OpenGL viewer (fly camera + lightmap) |
