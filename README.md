@@ -137,9 +137,17 @@ build\Release\viewer.exe --lightmap lightmap.hdr --res 512 --density 110
 | Scroll wheel | Increase / decrease movement speed |
 | `B` | **Bake the lightmap** (in-viewer, background thread) |
 | `F` | Toggle lightmap on/off (off = neutral shaded view) |
+| `G` | Toggle screen-space reflections (glossy) |
+| `P` | Toggle post (bloom / vignette / film grain) |
+| `T` | Toggle procedural surface texture + roughness |
 | `U` | Toggle UV-atlas debug view |
 | `R` | Reload the `--lightmap` file from disk |
 | `Esc` | Release the mouse; press again to quit |
+
+The viewer renders the scene to an HDR G-buffer, then a composite pass adds
+**screen-space reflections** (the glossy floor reflects the boxes/walls), **bloom**
+around the bright light, a filmic **ACES** tonemap, **vignette**, and subtle **film
+grain** — on top of the baked diffuse GI. Toggle each with the keys above.
 
 ### Viewer options
 
