@@ -1,0 +1,28 @@
+# Build output
+build/
+out/
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.lib
+*.exp
+
+# Vendored prebuilt OIDN SDK (download separately - see README)
+third_party/oidn/
+
+# Generated bake outputs
+lightmap.png
+lightmap.hdr
+preview.png
+*.tmp
+
+# Editor / OS
+.vs/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local Claude Code settings
+.claude/
