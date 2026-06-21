@@ -128,16 +128,19 @@ void main() {
     vec3 N = normalize(vNormal);
     vec3 albedo = vAlbedo;
 
-    // Procedural surface variation: faint multi-octave noise modulating albedo,
-    // and a roughness field so different surfaces reflect differently.
-    float rough = 0.6;
+    // Everything is matte by default (rough = 1 => no reflections). Only the
+    // FLOOR (upward normal) is glossy, so walls never reflect. The .a channel
+    // is the reflectivity signal the SSR pass keys on.
+    float rough = 1.0;
+    bool isFloor = (N.y > 0.85);
+    if (isFloor) rough = 0.12;          // polished floor
+
+    // Optional faint surface texture (albedo variation only - does NOT make
+    // walls reflective, which was the source of the blotchy artifacts).
     if (uUseTexture == 1) {
         float n = vnoise(vWorldPos * 18.0) * 0.6 + vnoise(vWorldPos * 60.0) * 0.4;
-        albedo *= (0.93 + 0.07 * n);                 // subtle tonal variation
-        rough = clamp(0.35 + 0.25 * n, 0.05, 0.9);   // varied micro-roughness
+        albedo *= (0.95 + 0.05 * n);
     }
-    // The floor (normal ~ +Y) is glossier so reflections read clearly.
-    if (N.y > 0.7) rough = min(rough, 0.18);
 
     vec3 col;
     if (uMode == 1) {
@@ -200,27 +203,29 @@ vec3 viewPos(vec2 uv){
 }
 
 // Screen-space reflection ray-march; returns reflected color and a hit mask.
+// Uses a tight thickness test to avoid false hits that smear across surfaces.
 vec3 ssr(vec3 P, vec3 N, out float hitMask){
     hitMask = 0.0;
     vec3 V = normalize(P);             // view dir (camera at origin in view space)
     vec3 R = reflect(V, N);
     if (R.z > 0.0) return vec3(0.0);   // reflecting toward camera plane: skip
-    float stepLen = 0.025;
-    vec3 pos = P;
-    for (int i=0;i<48;i++){
+    float stepLen = 0.02;
+    vec3 pos = P + N * 0.01;           // bias off the surface
+    for (int i=0;i<64;i++){
         pos += R * stepLen;
-        stepLen *= 1.07;               // grow step for range
+        stepLen *= 1.05;
         vec4 cs = uProj * vec4(pos,1.0);
         if (cs.w <= 0.0) break;
         vec2 uv = (cs.xy/cs.w)*0.5+0.5;
         if (uv.x<0.0||uv.x>1.0||uv.y<0.0||uv.y>1.0) break;
         float sceneZ = viewPos(uv).z;
-        if (pos.z < sceneZ - 0.002 && pos.z > sceneZ - 0.25){
-            hitMask = 1.0;
-            // fade near screen edges to hide SSR's edge artifacts
-            vec2 e = smoothstep(vec2(0.0), vec2(0.12), uv) *
-                     smoothstep(vec2(0.0), vec2(0.12), 1.0-uv);
-            hitMask *= e.x*e.y;
+        // Tight thickness window: ray must be just behind the stored surface.
+        float dz = sceneZ - pos.z;
+        if (dz > 0.001 && dz < 0.06){
+            // fade near screen edges to hide SSR's hard cutoffs
+            vec2 e = smoothstep(vec2(0.0), vec2(0.15), uv) *
+                     smoothstep(vec2(0.0), vec2(0.15), 1.0-uv);
+            hitMask = e.x*e.y;
             return texture(uScene, uv).rgb;
         }
     }
@@ -231,17 +236,16 @@ void main(){
     vec3 hdr = texture(uScene, vUV).rgb;
     vec4 nr  = texture(uNormalRough, vUV);
 
-    // --- Screen-space reflections (Fresnel-weighted, attenuated by roughness) ---
-    if (uSSR == 1 && nr.a < 0.5) {
+    // --- Screen-space reflections: floor only (rough < 0.3), subtle sheen ---
+    if (uSSR == 1 && nr.a < 0.3) {
         vec3 N = normalize(nr.xyz * 2.0 - 1.0);
         vec3 P = viewPos(vUV);
         if (P.z < 0.0) {
             float mask;
             vec3 refl = ssr(P, N, mask);
             float NoV = clamp(dot(N, normalize(-P)), 0.0, 1.0);
-            float fres = 0.04 + 0.96 * pow(1.0 - NoV, 5.0);     // Schlick
-            float gloss = 1.0 - nr.a / 0.5;                     // glossier -> stronger
-            hdr = mix(hdr, refl, mask * fres * clamp(gloss,0.0,1.0) * 0.9);
+            float fres = 0.03 + 0.20 * pow(1.0 - NoV, 5.0);   // weak, grazing-only
+            hdr = mix(hdr, refl, clamp(mask * fres, 0.0, 0.5));
         }
     }
 
