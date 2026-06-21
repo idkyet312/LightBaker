@@ -71,10 +71,10 @@ build\Release\baker.exe --res 256 --spp 64 --bounces 3
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--res N` | 1024 | Atlas resolution (N x N) |
+| `--res N` | 2048 | Atlas resolution (N x N) |
 | `--spp N` | 64 | Samples per texel (low is fine with denoise) |
 | `--bounces N` | 6 | Indirect diffuse bounces |
-| `--density F` | 220 | Texels per world unit (chart sizing) |
+| `--density F` | 360 | Texels per world unit (chart sizing) |
 | `--denoise` / `--no-denoise` | on | Denoise the bake with OIDN (if compiled in) |
 | `--exposure F` | 1.0 | Tonemap exposure |
 | `--out FILE` | lightmap.png | Atlas output |
@@ -141,6 +141,7 @@ build\Release\viewer.exe --lightmap lightmap.hdr --res 512 --density 110
 | `P` | Toggle post (bloom / vignette / film grain) |
 | `T` | Toggle procedural surface texture + roughness |
 | `X` | Toggle FXAA anti-aliasing |
+| `L` | Toggle subtle specular highlight |
 | `U` | Toggle UV-atlas debug view |
 | `R` | Reload the `--lightmap` file from disk |
 | `Esc` | Release the mouse; press again to quit |
@@ -155,8 +156,8 @@ grain** — on top of the baked diffuse GI. Toggle each with the keys above.
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `--lightmap FILE` | (none) | Preload an HDR atlas to display on start |
-| `--res N` | 1024 | Atlas resolution |
-| `--density F` | 220 | Texel density |
+| `--res N` | 2048 | Atlas resolution |
+| `--density F` | 360 | Texel density |
 | `--spp N` | 64 | Samples per texel for the in-viewer bake |
 | `--bounces N` | 6 | Indirect bounces for the in-viewer bake |
 | `--denoise` / `--no-denoise` | on | Denoise the in-viewer bake with OIDN |

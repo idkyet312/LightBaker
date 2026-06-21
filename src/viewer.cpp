@@ -112,6 +112,8 @@ uniform int uMode;          // 0 = shaded, 1 = lightmap, 2 = UV debug
 uniform vec3 uCamPos;
 uniform mat3 uNormalToView; // world->view for normals
 uniform int uUseTexture;    // procedural surface texture/roughness on/off
+uniform vec3 uLightPos;     // ceiling light center (for a subtle specular)
+uniform int uSpec;          // subtle specular highlight on/off
 
 // Value noise for subtle procedural surface variation.
 float hash13(vec3 p){ p=fract(p*0.1031); p+=dot(p,p.yzx+33.33); return fract((p.x+p.y)*p.z); }
@@ -146,6 +148,23 @@ void main() {
     if (uMode == 1) {
         vec3 irr = texture(uLightmap, vUV).rgb;
         col = irr * albedo * uExposure;              // linear HDR (no tonemap here)
+
+        // Subtle specular sheen from the ceiling light on ALL surfaces, so
+        // nothing reads as dead-flat matte. Broad lobe, Fresnel-boosted at
+        // grazing angles, tighter/stronger on the glossy floor.
+        if (uSpec == 1) {
+            vec3 V = normalize(uCamPos - vWorldPos);
+            vec3 Lp = normalize(uLightPos - vWorldPos);
+            vec3 H = normalize(V + Lp);
+            float ndl = max(dot(N, Lp), 0.0);
+            float ndh = max(dot(N, H), 0.0);
+            float shin = mix(24.0, 220.0, 1.0 - rough);   // floor = tighter highlight
+            float ndv = max(dot(N, V), 0.0);
+            float fres = 0.04 + 0.5 * pow(1.0 - ndv, 5.0);
+            float spec = pow(ndh, shin) * ndl * fres;
+            float strength = isFloor ? 1.2 : 0.35;
+            col += vec3(spec) * strength * uExposure;
+        }
     } else if (uMode == 2) {
         col = vec3(vUV, 0.0);
         rough = 1.0;
@@ -250,20 +269,20 @@ void main(){
         }
     }
 
-    // --- Bloom: cheap bright-pass blur sampled in a small disk ---
+    // --- Bloom: bright-pass blur in a wider disk, softer threshold + stronger ---
     if (uPost == 1) {
         vec3 bloom = vec3(0.0); float wsum = 0.0;
-        for (int i=0;i<12;i++){
-            float a = float(i)/12.0 * 6.2831853;
-            for (int r=1;r<=2;r++){
-                vec2 off = vec2(cos(a),sin(a)) * (float(r)*3.5) / uRes;
+        for (int i=0;i<16;i++){
+            float a = float(i)/16.0 * 6.2831853;
+            for (int r=1;r<=4;r++){
+                vec2 off = vec2(cos(a),sin(a)) * (float(r)*4.5) / uRes;
                 vec3 s = texture(uScene, vUV+off).rgb;
-                vec3 bright = max(s - 1.0, 0.0);    // only HDR > 1 blooms
+                vec3 bright = max(s - 0.8, 0.0);    // softer threshold -> bigger halo
                 float w = 1.0/float(r);
                 bloom += bright * w; wsum += w;
             }
         }
-        hdr += (bloom/max(wsum,1e-3)) * 0.5;
+        hdr += (bloom/max(wsum,1e-3)) * 0.8;
     }
 
     // --- Tonemap + gamma ---
@@ -426,6 +445,7 @@ static bool   g_ssr = true;      // screen-space reflections
 static bool   g_post = true;     // bloom/vignette/grain
 static bool   g_texture = true;  // procedural surface texture/roughness
 static bool   g_fxaa = true;     // FXAA anti-aliasing
+static bool   g_spec = true;     // subtle specular highlight
 static float  g_exposure = 1.4f;
 static double g_lastX = 0, g_lastY = 0;
 static bool   g_firstMouse = true;
@@ -520,6 +540,9 @@ static void keyCb(GLFWwindow* win, int key, int, int action, int) {
     } else if (key == GLFW_KEY_X) {
         g_fxaa = !g_fxaa;
         std::printf("FXAA: %s\n", g_fxaa ? "ON" : "OFF");
+    } else if (key == GLFW_KEY_L) {
+        g_spec = !g_spec;
+        std::printf("Specular highlight: %s\n", g_spec ? "ON" : "OFF");
     }
 }
 
@@ -603,15 +626,15 @@ static void usage(const char* exe) {
         "  B = bake lightmap (in viewer)   F = lightmap on/off\n"
         "  G = reflections (SSR) on/off     P = bloom/vignette/grain on/off\n"
         "  T = surface texture on/off       X = FXAA anti-aliasing on/off\n"
-        "  U = UV-atlas debug view\n"
+        "  L = specular highlight on/off    U = UV-atlas debug view\n"
         "  R = reload --lightmap from disk  ESC = release mouse / quit\n",
         exe);
 }
 
 int main(int argc, char** argv) {
     std::string lmPath;            // empty = no preloaded lightmap; bake with B
-    int res = 1024;
-    int density = 220;
+    int res = 2048;
+    int density = 360;
     int winW = 1280, winH = 800;
 
     auto needArg = [&](int& i) -> const char* {
@@ -699,6 +722,8 @@ int main(int argc, char** argv) {
     GLint locCam = glGetUniformLocation(prog, "uCamPos");
     GLint locN2V = glGetUniformLocation(prog, "uNormalToView");
     GLint locUseTex = glGetUniformLocation(prog, "uUseTexture");
+    GLint locSpec = glGetUniformLocation(prog, "uSpec");
+    GLint locLightPos = glGetUniformLocation(prog, "uLightPos");
 
     // Post/composite + FXAA programs (fullscreen passes) + a dummy VAO.
     GLuint post = makeProgram(kPostVert, kPostFrag);
@@ -791,6 +816,8 @@ int main(int argc, char** argv) {
         glUniform1f(locExp, g_exposure);
         glUniform1i(locMode, g_mode);
         glUniform1i(locUseTex, g_texture ? 1 : 0);
+        glUniform1i(locSpec, g_spec ? 1 : 0);
+        glUniform3f(locLightPos, 0.5f, 0.999f, 0.5f);   // ceiling light center
         glUniform3f(locCam, g_cam.pos.x, g_cam.pos.y, g_cam.pos.z);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, g_lmTex);

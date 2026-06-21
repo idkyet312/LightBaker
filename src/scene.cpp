@@ -1,4 +1,5 @@
 #include "scene.h"
+#include <utility>   // std::swap
 
 int Scene::addQuad(const Vec3& origin, const Vec3& edgeU, const Vec3& edgeV, int materialId) {
     Quad q;
@@ -48,28 +49,67 @@ void Scene::collectLights() {
     }
 }
 
-// Helper: build the 5 outward-or-inward-facing faces of an axis-aligned box.
-// 'lo'/'hi' are opposite corners. Normals point outward.
+// Helper: axis-aligned box, 6 outward-facing faces, normals into the room.
 static void addBox(Scene& s, const Vec3& lo, const Vec3& hi, int mat) {
     Vec3 dx{ hi.x - lo.x, 0, 0 };
     Vec3 dy{ 0, hi.y - lo.y, 0 };
     Vec3 dz{ 0, 0, hi.z - lo.z };
-
-    // Every face normal must point OUTWARD from the box (into the room) so the
-    // baker gathers light from the room side. normal = cross(edgeU, edgeV).
-
-    // Top (y=hi): normal +Y. cross(+X,+Z) = -Y, so use (dz,dx): cross(+Z,+X)=+Y.
     s.addQuad({lo.x, hi.y, lo.z}, dz, dx, mat);              // +Y
-    // Bottom (y=lo): normal -Y. cross(+X,+Z) = -Y.
     s.addQuad(lo, dx, dz, mat);                              // -Y
-    // Front (z=hi): normal +Z. cross(+X,+Y) = +Z.
     s.addQuad({lo.x, lo.y, hi.z}, dx, dy, mat);             // +Z
-    // Back (z=lo): normal -Z. cross(+Y,+X) = -Z.
     s.addQuad(lo, dy, dx, mat);                              // -Z
-    // Left (x=lo): normal -X. cross(+Z,+Y) = -X.
     s.addQuad(lo, dz, dy, mat);                              // -X
-    // Right (x=hi): normal +X. cross(+Y,+Z) = +X.
     s.addQuad({hi.x, lo.y, lo.z}, dy, dz, mat);             // +X
+}
+
+// Beveled box: the 6 faces are inset by 'b', and the 12 edges get angled
+// chamfer strips that catch a highlight - this removes the razor-sharp 90-degree
+// corners that read as "CG". Corners keep a tiny triangular gap that is
+// invisible at small bevel sizes. Faces are quads; chamfers reuse addQuad so
+// they get their own lightmap charts too.
+static void addBeveledBox(Scene& s, const Vec3& lo, const Vec3& hi, int mat, float b) {
+    float x0=lo.x, y0=lo.y, z0=lo.z, x1=hi.x, y1=hi.y, z1=hi.z;
+
+    // --- 6 inset faces (each shrunk by b on its two in-plane axes) ---
+    // +X face at x1, spanning y,z inset
+    s.addQuad({x1, y0+b, z0+b}, {0,(y1-y0)-2*b,0}, {0,0,(z1-z0)-2*b}, mat);
+    // -X face at x0
+    s.addQuad({x0, y0+b, z0+b}, {0,0,(z1-z0)-2*b}, {0,(y1-y0)-2*b,0}, mat);
+    // +Y face at y1
+    s.addQuad({x0+b, y1, z0+b}, {0,0,(z1-z0)-2*b}, {(x1-x0)-2*b,0,0}, mat);
+    // -Y face at y0
+    s.addQuad({x0+b, y0, z0+b}, {(x1-x0)-2*b,0,0}, {0,0,(z1-z0)-2*b}, mat);
+    // +Z face at z1
+    s.addQuad({x0+b, y0+b, z1}, {(x1-x0)-2*b,0,0}, {0,(y1-y0)-2*b,0}, mat);
+    // -Z face at z0
+    s.addQuad({x0+b, y0+b, z0}, {0,(y1-y0)-2*b,0}, {(x1-x0)-2*b,0,0}, mat);
+
+    // --- 12 edge chamfer strips (45-degree quads bridging adjacent faces) ---
+    float ix0=x0+b, ix1=x1-b, iy0=y0+b, iy1=y1-b, iz0=z0+b, iz1=z1-b;
+    Vec3 center{(x0+x1)*0.5f,(y0+y1)*0.5f,(z0+z1)*0.5f};
+    auto strip = [&](Vec3 a, Vec3 bb, Vec3 c, Vec3 d){
+        // Quad a,b,c,d. Ensure the normal points OUTWARD (away from box center)
+        // so the baker gathers light from the room side; swap edges if not.
+        Vec3 eU = bb - a, eV = d - a;
+        Vec3 mid = (a + bb + c + d) * 0.25f;
+        if (dot(cross(eU, eV), mid - center) < 0.0f) std::swap(eU, eV);
+        s.addQuad(a, eU, eV, mat);
+    };
+    // 4 chamfers parallel to X (vary the X span, bevel the YZ corner)
+    strip({ix0,y0,iz0},{ix1,y0,iz0},{ix1,iy0,z0},{ix0,iy0,z0}); // -Y/-Z
+    strip({ix0,iy0,z1},{ix1,iy0,z1},{ix1,y0,iz1},{ix0,y0,iz1}); // -Y/+Z
+    strip({ix0,iy1,z0},{ix1,iy1,z0},{ix1,y1,iz0},{ix0,y1,iz0}); // +Y/-Z
+    strip({ix0,y1,iz1},{ix1,y1,iz1},{ix1,iy1,z1},{ix0,iy1,z1}); // +Y/+Z
+    // 4 chamfers parallel to Y (vary Y, bevel XZ corner)
+    strip({x0,iy0,iz0},{x0,iy1,iz0},{ix0,iy1,z0},{ix0,iy0,z0}); // -X/-Z
+    strip({ix1,iy0,z0},{ix1,iy1,z0},{x1,iy1,iz0},{x1,iy0,iz0}); // +X/-Z
+    strip({ix0,iy0,z1},{ix0,iy1,z1},{x0,iy1,iz1},{x0,iy0,iz1}); // -X/+Z
+    strip({x1,iy0,iz1},{x1,iy1,iz1},{ix1,iy1,z1},{ix1,iy0,z1}); // +X/+Z
+    // 4 chamfers parallel to Z (vary Z, bevel XY corner)
+    strip({ix0,y0,iz0},{ix0,y0,iz1},{x0,iy0,iz1},{x0,iy0,iz0}); // -X/-Y
+    strip({x1,iy0,iz0},{x1,iy0,iz1},{ix1,y0,iz1},{ix1,y0,iz0}); // +X/-Y
+    strip({x0,iy1,iz0},{x0,iy1,iz1},{ix0,y1,iz1},{ix0,y1,iz0}); // -X/+Y
+    strip({ix1,y1,iz0},{ix1,y1,iz1},{x1,iy1,iz1},{x1,iy1,iz0}); // +X/+Y
 }
 
 Scene buildCornellBox() {
@@ -106,9 +146,11 @@ Scene buildCornellBox() {
         s.addQuad({x0, y, z0}, {x1 - x0, 0, 0}, {0, 0, z1 - z0}, light);
     }
 
-    // Two boxes inside (taller one rotated-ish via offset; here axis-aligned for simplicity).
-    addBox(s, {0.13f, 0.0f, 0.18f}, {0.42f, 0.55f, 0.47f}, white); // tall box
-    addBox(s, {0.55f, 0.0f, 0.52f}, {0.82f, 0.30f, 0.79f}, white); // short box
+    // Two boxes inside, with small chamfered edges so the corners catch light
+    // instead of reading as razor-sharp CG cubes.
+    const float bevel = 0.012f;
+    addBeveledBox(s, {0.13f, 0.0f, 0.18f}, {0.42f, 0.55f, 0.47f}, white, bevel); // tall box
+    addBeveledBox(s, {0.55f, 0.0f, 0.52f}, {0.82f, 0.30f, 0.79f}, white, bevel); // short box
 
     s.buildBVH();
     return s;

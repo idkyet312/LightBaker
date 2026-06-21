@@ -56,8 +56,8 @@ static void usage(const char* exe) {
 }
 
 int main(int argc, char** argv) {
-    int res = 1024;
-    int density = 220;
+    int res = 2048;
+    int density = 360;
     BakeSettings bs;
     bs.spp = 64;          // low spp is fine: OIDN denoises the result
     bs.bounces = 6;
