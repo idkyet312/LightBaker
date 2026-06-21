@@ -22,6 +22,8 @@
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
 
 #include "scene.h"
 #include "lightmap.h"
@@ -149,6 +151,29 @@ uniform int uUseTexture;    // procedural surface texture/roughness on/off
 uniform vec3 uLightPos;     // ceiling light center (for a subtle specular)
 uniform int uSpec;          // subtle specular highlight on/off
 
+// NTC-decoded PBR material, applied to the sphere only (vSSRTarget < 0.5).
+uniform int uUsePBR;            // master toggle
+uniform float uPBRTiling;       // material UV repeats across the sphere chart
+uniform sampler2D uPBRAlbedo;   // sRGB color
+uniform sampler2D uPBRNormal;   // tangent-space normal (DX convention)
+uniform sampler2D uPBRRough;    // .r roughness
+uniform sampler2D uPBRMetal;    // .r metalness
+uniform sampler2D uPBRAO;       // .r ambient occlusion
+
+// Perturb geometric normal N by a tangent-space normal map sample, building the
+// tangent frame analytically from screen-space derivatives (no precomputed
+// tangents needed). Standard "cotangent frame" trick (Mikkelsen).
+vec3 applyNormalMap(vec3 N, vec3 worldPos, vec2 uv, vec3 nTS) {
+    vec3 dp1 = dFdx(worldPos), dp2 = dFdy(worldPos);
+    vec2 du1 = dFdx(uv),       du2 = dFdy(uv);
+    vec3 dp2p = cross(dp2, N), dp1p = cross(N, dp1);
+    vec3 T = dp2p * du1.x + dp1p * du2.x;
+    vec3 B = dp2p * du1.y + dp1p * du2.y;
+    float inv = inversesqrt(max(dot(T, T), dot(B, B)));
+    mat3 TBN = mat3(T * inv, B * inv, N);
+    return normalize(TBN * nTS);
+}
+
 // Sample the lightmap for one fragment. Flat charts use ordinary clamped
 // bilinear (chart.w<=0). The sphere chart is PERIODIC in U: phi wraps 2pi->0,
 // so its left/right atlas edges are adjacent meridians. GL_CLAMP_TO_EDGE would
@@ -203,9 +228,25 @@ void main() {
     bool isFloor = (N.y > 0.85);
     if (isFloor) rough = 0.18;          // glossy, but not mirror-polished
 
+    // NTC-decoded PBR material on the sphere (vSSRTarget<0.5 tags the sphere).
+    // Reuse the sphere's chart-local UV (phi,theta) as material UV, tiled.
+    float metallic = 0.0;
+    float ao = 1.0;
+    bool isSphere = (vSSRTarget < 0.5);
+    if (uUsePBR == 1 && isSphere) {
+        vec2 muv = vUV * uPBRTiling;
+        albedo = texture(uPBRAlbedo, muv).rgb;
+        rough  = clamp(texture(uPBRRough, muv).r, 0.04, 1.0);
+        metallic = texture(uPBRMetal, muv).r;
+        ao = texture(uPBRAO, muv).r;
+        vec3 nTS = texture(uPBRNormal, muv).xyz * 2.0 - 1.0;
+        nTS.y = -nTS.y;                  // DX-style normal map -> GL (flip green)
+        N = applyNormalMap(N, vWorldPos, muv, nTS);
+    }
+
     // Optional faint surface texture (albedo variation only - does NOT make
     // walls reflective, which was the source of the blotchy artifacts).
-    if (uUseTexture == 1) {
+    else if (uUseTexture == 1) {
         float n = vnoise(vWorldPos * 18.0) * 0.6 + vnoise(vWorldPos * 60.0) * 0.4;
         albedo *= (0.95 + 0.05 * n);
     }
@@ -213,11 +254,15 @@ void main() {
     vec3 col;
     if (uMode == 1) {
         vec3 irr = sampleLightmap();
-        col = irr * albedo * uExposure;              // linear HDR (no tonemap here)
+        // Metals have (almost) no diffuse; AO darkens crevices. The baked
+        // irradiance is the incoming light; albedo/metallic/ao shape outgoing.
+        vec3 diffuseCol = albedo * (1.0 - metallic) * ao;
+        col = irr * diffuseCol * uExposure;          // linear HDR (no tonemap here)
 
         // Subtle specular sheen from the ceiling light on ALL surfaces, so
         // nothing reads as dead-flat matte. Broad lobe, Fresnel-boosted at
-        // grazing angles, tighter/stronger on the glossy floor.
+        // grazing angles, tighter/stronger on the glossy floor. For metals the
+        // specular is tinted by the albedo (F0 = albedo) and much stronger.
         if (uSpec == 1) {
             vec3 V = normalize(uCamPos - vWorldPos);
             vec3 Lp = normalize(uLightPos - vWorldPos);
@@ -226,10 +271,13 @@ void main() {
             float ndh = max(dot(N, H), 0.0);
             float shin = mix(24.0, 220.0, 1.0 - rough);   // floor = tighter highlight
             float ndv = max(dot(N, V), 0.0);
-            float fres = 0.04 + 0.5 * pow(1.0 - ndv, 5.0);
-            float spec = pow(ndh, shin) * ndl * fres;
-            float strength = isFloor ? 1.2 : 0.35;
-            col += vec3(spec) * strength * uExposure;
+            vec3 F0 = mix(vec3(0.04), albedo, metallic);
+            vec3 fres = F0 + (1.0 - F0) * pow(1.0 - ndv, 5.0);
+            vec3 spec = pow(ndh, shin) * ndl * fres;
+            float strength = isFloor ? 1.2 : (metallic > 0.5 ? 1.6 : 0.35);
+            // Metals also pick up the baked irradiance as a tinted reflection.
+            if (metallic > 0.0) spec += F0 * irr * metallic * (1.0 - rough);
+            col += spec * strength * uExposure;
         }
     } else if (uMode == 2) {
         col = vec3(vUV, 0.0);
@@ -237,8 +285,15 @@ void main() {
     } else {
         vec3 L = normalize(uCamPos - vWorldPos);
         float diff = abs(dot(N, L));
-        col = albedo * (0.25 + 0.75 * diff) * uExposure;
-        rough = 1.0;
+        col = albedo * (1.0 - metallic) * ao * (0.25 + 0.75 * diff) * uExposure;
+        if (uUsePBR == 1 && isSphere) {
+            // A headlight specular so the metal/normal detail is visible without a bake.
+            vec3 V = normalize(uCamPos - vWorldPos);
+            vec3 H = normalize(V + L);
+            vec3 F0 = mix(vec3(0.04), albedo, metallic);
+            float shin = mix(16.0, 200.0, 1.0 - rough);
+            col += F0 * pow(max(dot(N, H), 0.0), shin) * diff * 1.5 * uExposure;
+        }
     }
 
     oColor = vec4(col, 1.0);
@@ -517,6 +572,57 @@ static GLuint uploadLightmapPixels(const std::vector<Vec3>& px, int res, GLuint 
 }
 
 // ---------------------------------------------------------------------------
+// NTC-decoded PBR material maps (8-bit, tiled across the sphere with mipmaps).
+// 'srgb' selects an sRGB internal format for the color map so the shader works
+// in linear space; data maps (normal/roughness/metalness/AO) stay linear.
+// ---------------------------------------------------------------------------
+static GLuint g_pbrAlbedo = 0, g_pbrNormal = 0, g_pbrRough = 0,
+              g_pbrMetal = 0, g_pbrAO = 0;
+
+static GLuint loadPBRTexture(const std::string& path, bool srgb) {
+    int w, h, n;
+    unsigned char* data = stbi_load(path.c_str(), &w, &h, &n, 0);
+    if (!data) {
+        std::fprintf(stderr, "PBR: failed to load '%s': %s\n",
+                     path.c_str(), stbi_failure_reason());
+        return 0;
+    }
+    GLenum fmt = (n == 1) ? GL_RED : (n == 3) ? GL_RGB : GL_RGBA;
+    GLenum ifmt = fmt;
+    if (srgb) ifmt = (n == 3) ? GL_SRGB8 : GL_SRGB8_ALPHA8;
+    GLuint tex; glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, ifmt, w, h, 0, fmt, GL_UNSIGNED_BYTE, data);
+    glGenerateMipmap(GL_TEXTURE_2D);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    // Single-channel maps replicate R across RGB so the shader can read .r.
+    if (n == 1) {
+        GLint sw[4] = { GL_RED, GL_RED, GL_RED, GL_ONE };
+        glTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_RGBA, sw);
+    }
+    stbi_image_free(data);
+    return tex;
+}
+
+// Load all five maps the shader uses from 'dir'. Returns false if albedo
+// (the minimum) is missing. Maps the NTC decoder writes are named by semantic.
+static bool loadPBRMaterial(const std::string& dir) {
+    auto p = [&](const char* f) { return dir + "/" + f; };
+    g_pbrAlbedo = loadPBRTexture(p("Color.png"), /*srgb=*/true);
+    if (!g_pbrAlbedo) return false;
+    g_pbrNormal = loadPBRTexture(p("Normal.png"), false);
+    g_pbrRough  = loadPBRTexture(p("Roughness.png"), false);
+    g_pbrMetal  = loadPBRTexture(p("Metalness.png"), false);
+    g_pbrAO     = loadPBRTexture(p("AmbientOcclusion.png"), false);
+    std::printf("Loaded NTC PBR material from %s\n", dir.c_str());
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Fly camera.
 // ---------------------------------------------------------------------------
 struct Camera {
@@ -551,6 +657,17 @@ static bool   g_captured = true;
 static std::string g_lmPath;
 static GLuint g_lmTex = 0;
 static bool   g_reloadRequested = false;
+
+// --- NTC-decoded PBR material on the sphere (the 'M' key) ---
+// (texture handles g_pbrAlbedo..g_pbrAO are declared above the loaders.)
+static std::string g_pbrDir;     // dir of decoded maps (empty = no PBR)
+static bool   g_pbr = false;     // apply the material to the sphere
+static bool   g_havePBR = false; // textures successfully loaded
+
+// --- Offline screenshot mode (--shot FILE): frame the sphere, render a few
+// settle frames, write a PNG, and exit. Used for deterministic verification.
+static std::string g_shotPath;   // empty = interactive
+static int    g_shotFrames = 8;  // render this many frames before capturing
 
 // --- In-process bake state (the 'B' key) ---
 enum class BakeState { Idle, Running, Done };
@@ -641,6 +758,14 @@ static void keyCb(GLFWwindow* win, int key, int, int action, int) {
     } else if (key == GLFW_KEY_L) {
         g_spec = !g_spec;
         std::printf("Specular highlight: %s\n", g_spec ? "ON" : "OFF");
+    } else if (key == GLFW_KEY_M) {
+        if (g_havePBR) {
+            g_pbr = !g_pbr;
+            std::printf("NTC PBR material on sphere: %s\n", g_pbr ? "ON" : "OFF");
+        } else {
+            std::printf("No PBR material loaded (use --pbr <dir>; "
+                        "decode it with scripts/decode_sphere_material.sh).\n");
+        }
     }
 }
 
@@ -718,6 +843,8 @@ static void usage(const char* exe) {
         "  --spp N          samples per texel for in-viewer bake (default 64)\n"
         "  --bounces N      indirect bounces for in-viewer bake (default 6)\n"
         "  --exposure F     display exposure (default 1.4)\n"
+        "  --pbr [DIR]      put NTC-decoded PBR material on the sphere\n"
+        "                   (DIR defaults to assets/sphere_material)\n"
         "  --width N --height N   window size (default 1280x800)\n"
         "\nControls:\n"
         "  WASD / Space / Ctrl  move; mouse = look; scroll = speed\n"
@@ -725,7 +852,8 @@ static void usage(const char* exe) {
         "  G = reflections (SSR) on/off     P = bloom/vignette/grain on/off\n"
         "  T = surface texture on/off       X = FXAA anti-aliasing on/off\n"
         "  L = specular highlight on/off    U = UV-atlas debug view\n"
-        "  R = reload --lightmap from disk  ESC = release mouse / quit\n",
+        "  M = NTC PBR material on sphere   R = reload --lightmap from disk\n"
+        "  ESC = release mouse / quit\n",
         exe);
 }
 
@@ -751,6 +879,12 @@ int main(int argc, char** argv) {
         else if (a == "--exposure") g_exposure = (float)std::atof(needArg(i));
         else if (a == "--width") winW = std::atoi(needArg(i));
         else if (a == "--height") winH = std::atoi(needArg(i));
+        else if (a == "--pbr") {
+            // Optional dir; default to the script's output location.
+            if (i + 1 < argc && argv[i + 1][0] != '-') g_pbrDir = argv[++i];
+            else g_pbrDir = "assets/sphere_material";
+        }
+        else if (a == "--shot") g_shotPath = needArg(i);
         else if (a == "-h" || a == "--help") { usage(argv[0]); return 0; }
         else { std::printf("Unknown option: %s\n", a.c_str()); usage(argv[0]); return 1; }
     }
@@ -827,6 +961,8 @@ int main(int argc, char** argv) {
     GLint locUseTex = glGetUniformLocation(prog, "uUseTexture");
     GLint locSpec = glGetUniformLocation(prog, "uSpec");
     GLint locLightPos = glGetUniformLocation(prog, "uLightPos");
+    GLint locUsePBR = glGetUniformLocation(prog, "uUsePBR");
+    GLint locPBRTiling = glGetUniformLocation(prog, "uPBRTiling");
 
     // Post/composite + FXAA programs (fullscreen passes) + a dummy VAO.
     GLuint post = makeProgram(kPostVert, kPostFrag);
@@ -851,9 +987,35 @@ int main(int argc, char** argv) {
     if (!g_haveLightmap)
         std::printf("No lightmap loaded - showing shaded view. Press B to bake.\n");
 
+    // Optionally load the NTC-decoded PBR material for the sphere (--pbr).
+    if (!g_pbrDir.empty()) {
+        if (loadPBRMaterial(g_pbrDir)) {
+            g_havePBR = true;
+            g_pbr = true;     // on by default when supplied
+            std::printf("Press M to toggle the NTC PBR material on the sphere.\n");
+        } else {
+            std::fprintf(stderr, "PBR: could not load material from '%s'. "
+                         "Run scripts/decode_sphere_material.sh first.\n",
+                         g_pbrDir.c_str());
+        }
+    }
+
+    // Offline screenshot: aim the camera at the sphere (center 0.68,0.162,0.64,
+    // radius 0.16) from a near, slightly-above angle so the material reads clearly.
+    if (!g_shotPath.empty()) {
+        g_captured = false;
+        glfwSetInputMode(win, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+        glm::vec3 sphere(0.68f, 0.162f, 0.64f);
+        g_cam.pos = sphere + glm::vec3(-0.22f, 0.14f, 0.32f);
+        glm::vec3 dir = glm::normalize(sphere - g_cam.pos);
+        g_cam.yaw = glm::degrees(std::atan2(dir.z, dir.x));
+        g_cam.pitch = glm::degrees(std::asin(dir.y));
+    }
+
     std::printf("Viewer ready. WASD + mouse to fly. B = bake, F = lightmap on/off, ESC = quit.\n");
 
     double last = glfwGetTime();
+    int frameCount = 0;
     while (!glfwWindowShouldClose(win)) {
         double now = glfwGetTime();
         float dt = (float)(now - last);
@@ -926,6 +1088,25 @@ int main(int argc, char** argv) {
         glBindTexture(GL_TEXTURE_2D, g_lmTex);
         glUniform1i(locTex, 0);
         glUniform1f(locAtlasRes, (float)res);
+
+        // NTC PBR material samplers on units 1..5 (sphere only, when enabled).
+        bool pbrOn = g_pbr && g_havePBR;
+        glUniform1i(locUsePBR, pbrOn ? 1 : 0);
+        glUniform1f(locPBRTiling, 3.0f);   // repeats across the sphere chart
+        if (pbrOn) {
+            struct { GLenum unit; GLuint tex; const char* name; } binds[] = {
+                { GL_TEXTURE1, g_pbrAlbedo, "uPBRAlbedo" },
+                { GL_TEXTURE2, g_pbrNormal, "uPBRNormal" },
+                { GL_TEXTURE3, g_pbrRough,  "uPBRRough"  },
+                { GL_TEXTURE4, g_pbrMetal,  "uPBRMetal"  },
+                { GL_TEXTURE5, g_pbrAO,     "uPBRAO"     },
+            };
+            for (int i = 0; i < 5; ++i) {
+                glActiveTexture(binds[i].unit);
+                glBindTexture(GL_TEXTURE_2D, binds[i].tex);
+                glUniform1i(glGetUniformLocation(prog, binds[i].name), 1 + i);
+            }
+        }
         glBindVertexArray(vao);
         glDrawArrays(GL_TRIANGLES, 0, (GLsizei)verts.size());
 
@@ -963,6 +1144,21 @@ int main(int argc, char** argv) {
         glDrawArrays(GL_TRIANGLES, 0, 3);
 
         glfwSwapBuffers(win);
+
+        // Offline screenshot: after a few settle frames, read the back buffer
+        // (the FXAA pass blits to the default framebuffer) and write a PNG.
+        if (!g_shotPath.empty() && ++frameCount >= g_shotFrames) {
+            std::vector<unsigned char> px((size_t)fbw * fbh * 3);
+            glReadBuffer(GL_BACK);
+            glPixelStorei(GL_PACK_ALIGNMENT, 1);
+            glReadPixels(0, 0, fbw, fbh, GL_RGB, GL_UNSIGNED_BYTE, px.data());
+            stbi_flip_vertically_on_write(1);   // GL origin is bottom-left
+            if (stbi_write_png(g_shotPath.c_str(), fbw, fbh, 3, px.data(), fbw * 3))
+                std::printf("Wrote screenshot %s (%dx%d)\n", g_shotPath.c_str(), fbw, fbh);
+            else
+                std::fprintf(stderr, "Failed to write screenshot %s\n", g_shotPath.c_str());
+            break;
+        }
     }
 
     if (g_bakeThread.joinable()) g_bakeThread.join();

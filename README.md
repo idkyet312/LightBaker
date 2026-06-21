@@ -158,8 +158,30 @@ build\Release\viewer.exe --lightmap lightmap.hdr --res 512 --density 110
 | `X` | Toggle FXAA anti-aliasing |
 | `L` | Toggle subtle specular highlight |
 | `U` | Toggle UV-atlas debug view |
+| `M` | Toggle the **NTC PBR material** on the sphere (needs `--pbr`) |
 | `R` | Reload the `--lightmap` file from disk |
 | `Esc` | Release the mouse; press again to quit |
+
+#### NTC PBR material on the sphere
+
+With the NTC SDK built (see [NTC_SETUP.md](NTC_SETUP.md)), you can put a real
+NVIDIA-NTC-compressed PBR material on the sphere. First decode it once:
+
+```sh
+bash scripts/decode_sphere_material.sh   # MetalPlates013 -> assets/sphere_material/*.png
+```
+
+This compresses the 10-channel 2K material bundle to a single `.ntc` (~2 MB, vs
+~12 MB BCn) and decompresses it on the GPU. Then launch with `--pbr`:
+
+```sh
+build\Release\viewer.exe --lightmap lightmap.hdr --res 512 --density 110 --pbr
+```
+
+The sphere samples albedo / normal / roughness / metalness / AO from the decoded
+maps (tangent frame derived in-shader), lit by the baked GI. Toggle with `M`.
+`--shot FILE` renders one framed screenshot of the sphere and exits (used for
+verification).
 
 The viewer renders the scene to an HDR G-buffer, then a composite pass adds
 **screen-space reflections** (the glossy floor reflects the objects/walls), **bloom**
@@ -177,6 +199,8 @@ grain** — on top of the baked diffuse GI. Toggle each with the keys above.
 | `--bounces N` | 6 | Indirect bounces for the in-viewer bake |
 | `--denoise` / `--no-denoise` | on | Denoise the in-viewer bake with OIDN |
 | `--exposure F` | 1.4 | Display exposure |
+| `--pbr [DIR]` | (off) | Apply NTC-decoded PBR material to the sphere (`DIR` defaults to `assets/sphere_material`) |
+| `--shot FILE` | (off) | Render one framed screenshot of the sphere and exit |
 | `--width / --height N` | 1280 / 800 | Window size |
 
 ## Source layout

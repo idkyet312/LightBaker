@@ -27,6 +27,14 @@ ntc_demo.png
 *_ntc_out/
 ntc_out/
 
+# NTC-decoded sphere PBR material (regenerate: scripts/decode_sphere_material.sh)
+assets/sphere_material/
+
+# Scratch screenshots / atlases from PBR demo runs
+pbr_*.png
+pbr_*.hdr
+_pbr_*.png
+
 # Generated bake outputs
 lightmap.png
 lightmap.hdr
