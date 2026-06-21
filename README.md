@@ -29,9 +29,14 @@ baker still works — just bake at higher `--spp`. Toggle per run with `--denois
 The baked atlas can be round-tripped through NVIDIA's
 [RTX Neural Texture Compression SDK](https://github.com/NVIDIA-RTX/RTXNTC)
 (bake → compress to `.ntc` → decompress → display) as an end-to-end NTC demo.
+Once the SDK's `ntc-cli` is built, `bash scripts/ntc_roundtrip.sh` bakes an
+atlas, compresses it on the GPU, decompresses it, and reports the result —
+verified on an RTX 4060 at **~55 dB PSNR, ~6× smaller than raw, sub-millisecond
+GPU decode**.
+
 The SDK is ~588 MB and built from source against CUDA, so it is **not committed**
 (git-ignored under `third_party/RTXNTC/`). See **[NTC_SETUP.md](NTC_SETUP.md)**
-for the one-time CUDA + build steps.
+for the one-time CUDA + build steps and the full round-trip walkthrough.
 
 ## What it does
 

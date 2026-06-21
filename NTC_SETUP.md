@@ -57,59 +57,92 @@ compression *and* decompression, so no DX12/Vulkan shader plumbing is required.
 Turn off the renderer, explorer, tests, and DLSS to keep the build small and
 avoid the DX12 preview-Agility-SDK download.
 
-From the **x64 Native Tools Command Prompt for VS 2022** (so MSVC + CUDA are on
-PATH):
+These are the **verified** flags used on this machine (CMake 4.2.2 + VS 2022 +
+CUDA 12.9). Run from a shell where the CUDA toolkit is on PATH and `CUDA_PATH`
+points at it:
 
 ```sh
 cd third_party/RTXNTC
-cmake -B build -G "Visual Studio 17 2022" -A x64 ^
-      -DNTC_WITH_RENDERER=OFF ^
-      -DNTC_WITH_TESTS=OFF ^
-      -DDONUT_WITH_DLSS=OFF ^
-      -DDONUT_WITH_DX12=OFF
+export CUDA_PATH="C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+export PATH="/c/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.9/bin:$PATH"
+
+cmake -B build -G "Visual Studio 17 2022" -A x64 \
+      -DNTC_WITH_RENDERER=OFF \
+      -DNTC_WITH_TESTS=OFF \
+      -DDONUT_WITH_DLSS=OFF \
+      -DDONUT_WITH_DX12=OFF \
+      -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+      -DCUDAToolkit_ROOT="C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9" \
+      -DCMAKE_CUDA_COMPILER="C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9\\bin\\nvcc.exe"
+
 cmake --build build --config Release --target ntc-cli
 ```
 
-The resulting tool lands at:
+Why each non-obvious flag is needed (learned the hard way):
+
+- `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` — CMake 4 rejects the old
+  `cmake_minimum_required` in several submodules (donut/glfw/nvrhi). **In
+  PowerShell this value gets mangled by backtick line-continuation** (splits into
+  `3` + `.5`); run the configure from Bash, or keep it on one line.
+- `-DCMAKE_CUDA_COMPILER=...nvcc.exe` + `CUDA_PATH` — without an explicit
+  toolkit path the MSBuild CUDA targets fail with *"The CUDA Toolkit v12.9
+  directory '' does not exist"* if CUDA isn't already on the process PATH.
+- `-DDONUT_WITH_DX12=OFF` — avoids the preview Agility-SDK / DirectStorage
+  downloads. We decompress via CUDA, so DX12 isn't needed.
+
+The first build takes a while (it compiles donut, nvrhi, LibNTC's CUDA kernels,
+and ~90 HLSL/Slang shaders). The resulting tool lands at:
 
 ```
-third_party/RTXNTC/build/bin/ntc-cli.exe
+third_party/RTXNTC/bin/windows-x64/ntc-cli.exe
 ```
 
-> If CMake 4 rejects an old submodule's `cmake_minimum_required`, add
-> `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` to the configure line.
+(Note: the SDK overrides the output dir to `bin/windows-x64/`, **not**
+`build/bin/`.) A harmless `'pwsh.exe' is not recognized` warning during the
+build is fine — ShaderMake falls back to `dxc` directly.
 
 Smoke-test it:
 
 ```sh
-third_party/RTXNTC/build/bin/ntc-cli.exe --listCudaDevices
+third_party/RTXNTC/bin/windows-x64/ntc-cli.exe --listCudaDevices
+# -> Device 0: NVIDIA GeForce RTX 4060 (compute capability 8.9, 8187 MB VRAM)
 ```
 
-You should see your RTX 4060 listed.
+## 4. Run the end-to-end round-trip
 
-## 4. Use it from the baker workflow
-
-Once `ntc-cli.exe` exists, the demo flow is:
+Use the helper script — it bakes (if no atlas given), NTC-compresses, decompresses
+on the GPU, and prints a size/quality summary:
 
 ```sh
-# 1. Bake the lightmap to PNG as usual
-build\Release\baker.exe --res 512 --spp 256 --bounces 4 --out lightmap.png
+# bake a fresh 512x512 atlas and round-trip it at 4 bpp:
+bash scripts/ntc_roundtrip.sh
 
-# 2. Compress the atlas with real NTC (runs on the GPU)
-third_party\RTXNTC\build\bin\ntc-cli.exe ^
-    lightmap.png --compress --bitsPerPixel 4 ^
-    --decompress --saveCompressed lightmap.ntc
-
-# 3. Decompress back to an image to compare (PSNR is printed during compress)
-third_party\RTXNTC\build\bin\ntc-cli.exe ^
-    lightmap.ntc --decompress --saveImages ntc_out/
-
-# 4. View the round-tripped atlas
-build\Release\viewer.exe --lightmap ntc_out\lightmap.png --res 512
+# or round-trip an existing atlas at a chosen bitrate:
+bash scripts/ntc_roundtrip.sh lightmap.png 4
 ```
 
-This will be wrapped behind a baker flag (`--ntc`) and documented in the README
-once `ntc-cli` is confirmed building on this machine.
+It runs the equivalent of:
+
+```sh
+CLI=third_party/RTXNTC/bin/windows-x64/ntc-cli.exe
+# compress (+ report PSNR), then decompress to an image
+"$CLI" lightmap.png --compress --bitsPerPixel 4 --decompress --saveCompressed lightmap.ntc
+"$CLI" lightmap.ntc --decompress --saveImages ntc_out/
+# view the round-tripped atlas
+build/Release/viewer.exe --lightmap ntc_out/lightmap.png --res 512
+```
+
+### Verified result (512×512 Cornell-box lightmap, 4 bpp, RTX 4060)
+
+| Metric | Value |
+|--------|------:|
+| Reconstruction PSNR | **54–56 dB** (visually lossless) |
+| `.ntc` file size | ~132 KB @ 4.0 bpp |
+| vs **raw** (512×512×3 = 786 KB) | **~6× smaller** |
+| GPU decompression time | **0.5–1.0 ms** |
+
+> The size win is best measured against *raw* pixels — a single irradiance PNG is
+> already entropy-coded, so `.ntc` (132 KB) vs PNG (162 KB) understates it.
 
 ## Notes / gotchas
 
